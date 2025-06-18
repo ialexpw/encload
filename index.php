@@ -1,10 +1,22 @@
 <?php
-// --- PART 0: SESSION MANAGEMENT ---
+// --- PART 0: SESSION & DATABASE SETUP ---
 session_start();
 
-$is_logged_in = isset($_SESSION['user_password']);
+$db_file = 'vault.db';
+$db_is_new = !file_exists($db_file);
+$pdo = new PDO('sqlite:' . $db_file);
+$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
-// --- Server-Side PHP Logic ---
+if ($db_is_new) {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )");
+}
+
+$is_logged_in = isset($_SESSION['user_id']);
 $upload_dir = 'uploads/';
 if (!is_dir($upload_dir)) {
     mkdir($upload_dir, 0755, true);
@@ -12,95 +24,83 @@ if (!is_dir($upload_dir)) {
 $base_path = realpath($upload_dir);
 
 // --- HELPER FUNCTIONS ---
-function format_bytes($bytes, $precision = 2) {
-    if ($bytes === false) return 'N/A';
-    $units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    $bytes = max($bytes, 0); $pow = floor(($bytes ? log($bytes) : 0) / log(1024));
-    $pow = min($pow, count($units) - 1); $bytes /= (1 << (10 * $pow));
-    return round($bytes, $precision) . ' ' . $units[$pow];
-}
+function format_bytes($bytes, $precision = 2) { if ($bytes === false) return 'N/A'; $units = ['B', 'KB', 'MB', 'GB', 'TB']; $bytes = max($bytes, 0); $pow = floor(($bytes ? log($bytes) : 0) / log(1024)); $pow = min($pow, count($units) - 1); $bytes /= (1 << (10 * $pow)); return round($bytes, $precision) . ' ' . $units[$pow]; }
+function get_media_type($filename) { $image_exts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp']; $video_exts = ['mp4', 'webm', 'ogg', 'mov', 'avi', 'wmv', 'mkv']; $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION)); if (in_array($extension, $image_exts)) return 'image'; if (in_array($extension, $video_exts)) return 'video'; return 'file'; }
+function sanitize_path($path, $base_path) { $path = urldecode($path); $path = preg_replace('~/{2,}~', '/', $path); $path = trim($path, '/'); $path_parts = explode('/', $path); $safe_parts = []; foreach ($path_parts as $part) { if ($part !== '.' && $part !== '..') { $safe_parts[] = $part; } } $safe_path_suffix = implode('/', $safe_parts); $full_path = $base_path . '/' . $safe_path_suffix; $real_base = realpath($base_path); $real_full_path = realpath($full_path); if ($real_full_path === false) { $real_full_path = $full_path; } if (strpos($real_full_path, $real_base) !== 0) { return false; } return '/' . $safe_path_suffix; }
 
-function get_media_type($filename) {
-    $image_exts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'];
-    $video_exts = ['mp4', 'webm', 'ogg', 'mov', 'avi', 'wmv', 'mkv'];
-    $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
-    if (in_array($extension, $image_exts)) return 'image';
-    if (in_array($extension, $video_exts)) return 'video';
-    return 'file';
-}
+// --- API & AUTH ACTIONS ---
+$action = $_REQUEST['action'] ?? null;
+if ($action) {
 
-function sanitize_path($path, $base_path) {
-    $path = urldecode($path);
-    // Prevent directory traversal by normalizing the path
-    $path = preg_replace('~/{2,}~', '/', $path); // Replace multiple slashes
-    $path = trim($path, '/');
-    $path_parts = explode('/', $path);
-    $safe_parts = [];
-    foreach ($path_parts as $part) {
-        if ($part !== '.' && $part !== '..') {
-            $safe_parts[] = $part;
+    // --- Public Actions (Login/Register) ---
+    if ($action === 'register') {
+        header('Content-Type: application/json');
+        $email = $_POST['email'] ?? '';
+        $password = $_POST['password'] ?? '';
+        if (empty($email) || empty($password) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            http_response_code(400); echo json_encode(['status' => 'error', 'message' => 'Invalid input.']); exit();
         }
-    }
-    $safe_path_suffix = implode('/', $safe_parts);
-    $full_path = $base_path . '/' . $safe_path_suffix;
-
-    // Normalize paths for comparison
-    $real_base = realpath($base_path);
-    $real_full_path = realpath($full_path);
-
-    // If the path doesn't exist yet, we check its intended location
-    if ($real_full_path === false) {
-        $real_full_path = $full_path;
-    }
-
-    if (strpos($real_full_path, $real_base) !== 0) {
-        return false; // Path is outside of the base directory
-    }
-    return '/' . $safe_path_suffix;
-}
-
-// --- API-LIKE ACTIONS (ROUTING) ---
-if ($is_logged_in && isset($_REQUEST['action'])) {
-    header('Content-Type: application/json');
-    $action = $_REQUEST['action'];
-    $current_path_unsafe = isset($_REQUEST['path']) ? $_REQUEST['path'] : '/';
-    $current_path = sanitize_path($current_path_unsafe, $base_path);
-
-    if ($current_path === false && $action !== 'logout') {
-        http_response_code(403);
-        echo json_encode(['status' => 'error', 'message' => 'Forbidden path.']);
+        $stmt = $pdo->prepare("SELECT id FROM users WHERE email = ?");
+        $stmt->execute([$email]);
+        if ($stmt->fetch()) {
+            http_response_code(409); echo json_encode(['status' => 'error', 'message' => 'Email already registered.']); exit();
+        }
+        $hash = password_hash($password, PASSWORD_DEFAULT);
+        $stmt = $pdo->prepare("INSERT INTO users (email, password_hash) VALUES (?, ?)");
+        if ($stmt->execute([$email, $hash])) {
+            $user_id = $pdo->lastInsertId();
+            if (!is_dir($upload_dir . $user_id)) {
+                mkdir($upload_dir . $user_id, 0755, true);
+            }
+            echo json_encode(['status' => 'success', 'message' => 'Registration successful. Please log in.']);
+        } else { http_response_code(500); echo json_encode(['status' => 'error', 'message' => 'Registration failed.']); }
         exit();
     }
-    $full_current_path = $base_path . $current_path;
 
+    if ($action === 'login') {
+        header('Content-Type: application/json');
+        $email = $_POST['email'] ?? '';
+        $password = $_POST['password'] ?? '';
+        $stmt = $pdo->prepare("SELECT id, password_hash FROM users WHERE email = ?");
+        $stmt->execute([$email]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($user && password_verify($password, $user['password_hash'])) {
+            $_SESSION['user_id'] = $user['id'];
+            $_SESSION['user_email'] = $email;
+            echo json_encode(['status' => 'success']);
+        } else { http_response_code(401); echo json_encode(['status' => 'error', 'message' => 'Invalid email or password.']); }
+        exit();
+    }
+
+    if ($action === 'logout') {
+        $_SESSION = [];
+        session_destroy();
+        header('Location: ' . basename(__FILE__));
+        exit();
+    }
+
+    // --- Logged-in Actions ---
+    if (!$is_logged_in) {
+        http_response_code(401); echo json_encode(['status' => 'error', 'message' => 'Authentication required.']); exit();
+    }
+
+    header('Content-Type: application/json');
+    $user_upload_dir = $upload_dir . $_SESSION['user_id'] . '/';
+    if (!is_dir($user_upload_dir)) { mkdir($user_upload_dir, 0755, true); }
+    $user_base_path = realpath($user_upload_dir);
+
+    $current_path_unsafe = isset($_REQUEST['path']) ? $_REQUEST['path'] : '/';
+    $current_path = sanitize_path($current_path_unsafe, $user_base_path);
+    if ($current_path === false) { http_response_code(403); echo json_encode(['status' => 'error', 'message' => 'Forbidden path.']); exit(); }
+    $full_current_path = $user_base_path . $current_path;
 
     switch ($action) {
-        case 'logout':
-            $_SESSION = [];
-            session_destroy();
-            header('Location: ' . basename(__FILE__));
-            exit();
-
-        case 'set_theme':
-            if (isset($_GET['theme']) && in_array($_GET['theme'], ['light', 'dark'])) {
-                $_SESSION['theme'] = $_GET['theme'];
-                echo json_encode(['status' => 'success']);
-            } else { http_response_code(400); echo json_encode(['status' => 'error', 'message' => 'Invalid theme.']); }
-            break;
-
-        case 'set_view':
-            if (isset($_GET['view']) && in_array($_GET['view'], ['list', 'grid'])) {
-                $_SESSION['view_mode'] = $_GET['view'];
-                echo json_encode(['status' => 'success']);
-            } else { http_response_code(400); echo json_encode(['status' => 'error', 'message' => 'Invalid view mode.']); }
-            break;
+        case 'set_theme': if (isset($_GET['theme']) && in_array($_GET['theme'], ['light', 'dark'])) { $_SESSION['theme'] = $_GET['theme']; echo json_encode(['status' => 'success']); } else { http_response_code(400); echo json_encode(['status' => 'error']); } break;
+        case 'set_view': if (isset($_GET['view']) && in_array($_GET['view'], ['list', 'grid'])) { $_SESSION['view_mode'] = $_GET['view']; echo json_encode(['status' => 'success']); } else { http_response_code(400); echo json_encode(['status' => 'error']); } break;
 
         case 'list':
             $items = [];
-            if (!is_dir($full_current_path)) {
-                echo json_encode(['status' => 'success', 'items' => []]);
-                exit();
-            }
+            if (!is_dir($full_current_path)) { echo json_encode(['status' => 'success', 'items' => []]); exit(); }
             $dir_contents = scandir($full_current_path);
             foreach ($dir_contents as $item) {
                 if ($item === '.' || $item === '..') continue;
@@ -109,24 +109,14 @@ if ($is_logged_in && isset($_REQUEST['action'])) {
                     $items[] = ['name' => htmlspecialchars($item), 'type' => 'folder'];
                 } else if (pathinfo($item, PATHINFO_EXTENSION) === 'enc') {
                     $original_filename = preg_replace('/\.enc$/', '', $item);
-                    $items[] = [
-                        'encrypted_name' => htmlspecialchars($item),
-                        'original_name' => htmlspecialchars($original_filename),
-                        'size' => format_bytes(filesize($item_path)),
-                        'media_type' => get_media_type($original_filename),
-                        'type' => 'file'
-                    ];
+                    $items[] = [ 'encrypted_name' => htmlspecialchars($item), 'original_name' => htmlspecialchars($original_filename), 'size' => format_bytes(filesize($item_path)), 'media_type' => get_media_type($original_filename), 'type' => 'file' ];
                 }
             }
             echo json_encode(['status' => 'success', 'items' => $items]);
             break;
 
         case 'upload':
-             if (!is_dir($full_current_path)) {
-                http_response_code(400);
-                echo json_encode(['status' => 'error', 'message' => 'Upload path is not a valid directory.']);
-                exit();
-            }
+             if (!is_dir($full_current_path)) { http_response_code(400); echo json_encode(['status' => 'error', 'message' => 'Upload path is not a valid directory.']); exit(); }
             $filename = isset($_GET['filename']) ? basename($_GET['filename']) : 'encrypted-file';
             $original_sanitized_name = preg_replace("/[^a-zA-Z0-9._-]/", '', $filename);
             $destination = $full_current_path . '/' . $original_sanitized_name . '.enc';
@@ -144,11 +134,7 @@ if ($is_logged_in && isset($_REQUEST['action'])) {
 
         case 'create_folder':
             $folder_name = isset($_POST['name']) ? basename($_POST['name']) : '';
-            if (empty($folder_name) || strpbrk($folder_name, "\\/?%*:|\"<>")) {
-                 http_response_code(400);
-                 echo json_encode(['status' => 'error', 'message' => 'Invalid folder name.']);
-                 exit();
-            }
+            if (empty($folder_name) || strpbrk($folder_name, "\\/?%*:|\"<>")) { http_response_code(400); echo json_encode(['status' => 'error', 'message' => 'Invalid folder name.']); exit(); }
             $new_folder_path = $full_current_path . '/' . $folder_name;
             if (!is_dir($new_folder_path) && mkdir($new_folder_path, 0755, true)) {
                 echo json_encode(['status' => 'success', 'message' => 'Folder created.']);
@@ -162,31 +148,16 @@ if ($is_logged_in && isset($_REQUEST['action'])) {
             if (!file_exists($item_path)) { http_response_code(404); echo json_encode(['status' => 'error', 'message' => 'Item not found.']); exit(); }
 
             if (is_dir($item_path)) {
-                // For simplicity, only allow deleting empty folders
-                if (count(scandir($item_path)) > 2) {
-                     http_response_code(400); echo json_encode(['status' => 'error', 'message' => 'Folder is not empty.']);
-                } else if (rmdir($item_path)) {
-                     echo json_encode(['status' => 'success']);
+                if (count(scandir($item_path)) > 2) { http_response_code(400); echo json_encode(['status' => 'error', 'message' => 'Folder is not empty.']);
+                } else if (rmdir($item_path)) { echo json_encode(['status' => 'success']);
                 } else { http_response_code(500); echo json_encode(['status' => 'error', 'message' => 'Failed to delete folder.']); }
             } else {
-                if (unlink($item_path)) {
-                    echo json_encode(['status' => 'success']);
+                if (unlink($item_path)) { echo json_encode(['status' => 'success']);
                 } else { http_response_code(500); echo json_encode(['status' => 'error', 'message' => 'Failed to delete file.']); }
             }
             break;
     }
     exit();
-}
-
-// Handle login POST separately
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
-    if (!empty($_POST['password'])) {
-        $_SESSION['user_password'] = $_POST['password'];
-        header('Location: ' . basename(__FILE__));
-        exit();
-    } else {
-        $login_error = 'Password cannot be empty.';
-    }
 }
 ?>
 <!DOCTYPE html>
@@ -197,28 +168,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
     <title>Secure Vault</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
-      tailwind.config = {
-        darkMode: 'class',
-      }
+      tailwind.config = { darkMode: 'class' }
     </script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Inter', sans-serif; }
-        .progress-bar { transition: width 0.2s ease-in-out; }
+        .progress-bar, .file-container.deleting { transition: all 0.3s ease; }
         .modal-backdrop { background-color: rgba(0,0,0,0.5); }
         .lightbox-backdrop { background-color: rgba(0,0,0,0.8); }
         .dragover { border-color: #3b82f6; }
         .view-btn.active { background-color: #e0e7ff; }
         .dark .view-btn.active { background-color: #312e81; }
-        .file-container:hover .action-btn { opacity: 1; }
+        .file-container:hover .action-btn, .folder-item:hover .action-btn { opacity: 1; }
         .action-btn { opacity: 0; transition: opacity 0.2s; }
         .spinner { border: 2px solid #f3f3f3; border-top: 2px solid #3b82f6; border-radius: 50%; width: 14px; height: 14px; animation: spin 1s linear infinite; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         .toast { position: fixed; bottom: 1.5rem; right: 1.5rem; transform: translateY(200%); opacity: 0; transition: all 0.3s ease-in-out; z-index: 100; }
         .toast.show { transform: translateY(0); opacity: 1; }
-        .file-container.deleting { transition: all 0.3s ease; opacity: 0; transform: scale(0.9); }
+        .file-container.deleting { opacity: 0; transform: scale(0.9); }
         .delete-btn.confirming {
             opacity: 1 !important;
             background-color: white;
@@ -244,6 +213,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
                 <div class="flex items-center justify-between h-16">
                     <h1 class="text-xl font-bold text-gray-900 dark:text-gray-100">Secure Vault</h1>
                     <div class="flex items-center gap-4">
+                         <span class="text-sm text-gray-500 dark:text-gray-400 hidden sm:block"><?php echo htmlspecialchars($_SESSION['user_email']); ?></span>
                         <button id="theme-toggle-btn" class="p-1.5 rounded-md text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700">
                            <svg id="theme-icon-light" xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" /></svg>
                            <svg id="theme-icon-dark" xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 hidden" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" /></svg>
@@ -252,7 +222,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
                             <button id="view-list-btn" title="List View" class="view-btn p-1.5 rounded-md text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 5a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM3 10a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM3 15a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z" clip-rule="evenodd" /></svg></button>
                             <button id="view-grid-btn" title="Grid View" class="view-btn p-1.5 rounded-md text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path d="M5 3a2 2 0 00-2 2v2a2 2 0 002 2h2a2 2 0 002-2V5a2 2 0 00-2-2H5zM5 11a2 2 0 00-2 2v2a2 2 0 002 2h2a2 2 0 002-2v-2a2 2 0 00-2-2H5zM11 5a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V5zM11 13a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" /></svg></button>
                         </div>
-                        <a href="?action=logout" class="text-sm font-medium text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300">Logout</a>
+                        <button id="logout-btn" class="text-sm font-medium text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300">Logout</button>
                     </div>
                 </div>
             </div>
@@ -293,13 +263,56 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
     <div id="toast-container"></div>
 
     <?php else: ?>
-    <!-- /////////// LOGIN VIEW /////////// -->
-    <div class="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900"><div class="bg-white dark:bg-gray-800 p-8 rounded-lg shadow-md border border-gray-200 dark:border-gray-700 w-full max-w-sm"><h2 class="text-2xl font-bold mb-2 text-center text-gray-900 dark:text-gray-100">Secure Vault</h2><p class="text-center text-gray-600 dark:text-gray-400 mb-6">Enter your master password to login.</p><form method="POST" action="<?php echo basename(__FILE__); ?>" class="space-y-4"><div><label for="password-login" class="sr-only">Password:</label><input type="password" name="password" id="password-login" placeholder="Master Password" class="mt-1 block w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm placeholder-gray-400 focus:outline-none focus:ring-blue-500 focus:border-blue-500" required></div><?php if ($login_error): ?><p class="text-sm text-red-600"><?php echo $login_error; ?></p><?php endif; ?><button type="submit" class="w-full flex items-center justify-center bg-blue-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">Login</button></form></div></div>
+    <!-- /////////// AUTH VIEW /////////// -->
+     <div class="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900 px-4">
+        <div class="w-full max-w-md">
+            <h2 class="text-3xl font-bold text-center text-gray-900 dark:text-gray-100 mb-6">Secure Vault</h2>
+
+            <!-- Login Form -->
+            <div id="login-view">
+                <div class="bg-white dark:bg-gray-800 p-8 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
+                    <h3 class="text-xl font-semibold mb-4 text-center">Login</h3>
+                    <form id="login-form" class="space-y-4">
+                        <div>
+                            <label for="login-email" class="sr-only">Email:</label>
+                            <input type="email" name="email" id="login-email" placeholder="Email Address" class="mt-1 block w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm placeholder-gray-400 focus:outline-none focus:ring-blue-500 focus:border-blue-500" required>
+                        </div>
+                        <div>
+                            <label for="login-password" class="sr-only">Password:</label>
+                            <input type="password" name="password" id="login-password" placeholder="Password" class="mt-1 block w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm placeholder-gray-400 focus:outline-none focus:ring-blue-500 focus:border-blue-500" required>
+                        </div>
+                        <p id="login-error" class="text-sm text-red-600 hidden"></p>
+                        <button type="submit" class="w-full flex items-center justify-center bg-blue-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">Login</button>
+                    </form>
+                </div>
+                <p class="mt-4 text-center text-sm text-gray-600 dark:text-gray-400">Don't have an account? <a href="#" id="show-register" class="font-medium text-blue-600 hover:text-blue-500 dark:text-blue-400 dark:hover:text-blue-300">Sign up</a></p>
+            </div>
+
+            <!-- Registration Form -->
+            <div id="register-view" class="hidden">
+                 <div class="bg-white dark:bg-gray-800 p-8 rounded-lg shadow-md border border-gray-200 dark:border-gray-700">
+                    <h3 class="text-xl font-semibold mb-4 text-center">Create Account</h3>
+                    <form id="register-form" class="space-y-4">
+                         <div>
+                            <label for="register-email" class="sr-only">Email:</label>
+                            <input type="email" name="email" id="register-email" placeholder="Email Address" class="mt-1 block w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm placeholder-gray-400 focus:outline-none focus:ring-blue-500 focus:border-blue-500" required>
+                        </div>
+                        <div>
+                            <label for="register-password" class="sr-only">Password:</label>
+                            <input type="password" name="password" id="register-password" placeholder="Password" class="mt-1 block w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm placeholder-gray-400 focus:outline-none focus:ring-blue-500 focus:border-blue-500" required>
+                        </div>
+                        <p id="register-error" class="text-sm text-red-600 hidden"></p>
+                        <button type="submit" class="w-full flex items-center justify-center bg-blue-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">Create Account</button>
+                    </form>
+                </div>
+                <p class="mt-4 text-center text-sm text-gray-600 dark:text-gray-400">Already have an account? <a href="#" id="show-login" class="font-medium text-blue-600 hover:text-blue-500 dark:text-blue-400 dark:hover:text-blue-300">Log in</a></p>
+            </div>
+        </div>
+    </div>
+    <div id="toast-container"></div>
     <?php endif; ?>
 
 <script>
-<?php if ($is_logged_in): ?>
-
 const showToast = (text, type = 'info') => {
     const container = document.getElementById('toast-container');
     if (!container) return;
@@ -317,10 +330,25 @@ const showToast = (text, type = 'info') => {
     }, 4000);
 };
 
+<?php if ($is_logged_in): ?>
+
 document.addEventListener('DOMContentLoaded', () => {
-    const userPassword = "<?php echo addslashes($_SESSION['user_password']); ?>";
+    let encryptionPassword = sessionStorage.getItem('vaultPassword');
+    const getEncryptionPassword = async () => {
+        if (!encryptionPassword) {
+            encryptionPassword = prompt("For security, please re-enter your vault password to enable cryptographic operations for this session.");
+            if (encryptionPassword) {
+                sessionStorage.setItem('vaultPassword', encryptionPassword);
+            }
+        }
+        if (!encryptionPassword) {
+            showToast('Password required for encryption/decryption.', 'error');
+            return null;
+        }
+        return encryptionPassword;
+    };
+
     const SALT_LENGTH = 16, IV_LENGTH = 12, PBKDF2_ITERATIONS = 100000;
-    const UPLOAD_DIR = "<?php echo $upload_dir; ?>";
 
     let currentPath = '/';
     let currentView = '<?php echo $_SESSION['view_mode'] ?? 'grid'; ?>';
@@ -340,6 +368,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const themeToggleBtn = document.getElementById('theme-toggle-btn');
     const themeIconLight = document.getElementById('theme-icon-light');
     const themeIconDark = document.getElementById('theme-icon-dark');
+    const logoutBtn = document.getElementById('logout-btn');
 
     // Modal elements
     const uploadModal = document.getElementById('upload-modal');
@@ -360,7 +389,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const lightboxCloseBtn = document.getElementById('lightbox-close');
     const lightboxContent = document.getElementById('lightbox-content');
     const lightboxSpinner = document.getElementById('lightbox-spinner');
-
 
     let filesToUpload = [];
     const thumbnailCache = {}; // In-memory cache for generated thumbnails
@@ -535,6 +563,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     encryptBtn.addEventListener('click', async () => {
         if (filesToUpload.length === 0) { alert('Please select files to upload.'); return; }
+        const password = await getEncryptionPassword();
+        if (!password) return;
+
         encryptBtn.disabled = true;
         let allOk = true;
 
@@ -548,7 +579,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 const fileBuffer = await file.arrayBuffer();
                 const salt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
                 const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
-                const key = await deriveKey(userPassword, salt);
+                const key = await deriveKey(password, salt);
                 const encryptedContent = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, fileBuffer);
                 const encryptedPackage = new Uint8Array(SALT_LENGTH + IV_LENGTH + encryptedContent.byteLength);
                 encryptedPackage.set(salt, 0); encryptedPackage.set(iv, SALT_LENGTH); encryptedPackage.set(new Uint8Array(encryptedContent), SALT_LENGTH + IV_LENGTH);
@@ -589,7 +620,10 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function fetchAndDecrypt(filename, onProgress) {
-        const fullFilePath = `${UPLOAD_DIR}${currentPath}/${filename}`.replace(/\/+/g, '/');
+        const password = await getEncryptionPassword();
+        if (!password) throw new Error("Password not provided.");
+
+        const fullFilePath = `uploads/<?php echo $_SESSION['user_id']; ?>${currentPath}/${filename}`.replace(/\/+/g, '/');
         const response = await fetch(fullFilePath);
         if (!response.ok) throw new Error(`File not found on server (HTTP ${response.status}).`);
         const contentLength = +response.headers.get('Content-Length'); let receivedLength = 0; const chunks = [];
@@ -602,7 +636,7 @@ document.addEventListener('DOMContentLoaded', () => {
         let encryptedPackage = new Uint8Array(receivedLength); let position = 0;
         for (const chunk of chunks) { encryptedPackage.set(chunk, position); position += chunk.length; }
         const salt = encryptedPackage.slice(0, SALT_LENGTH); const iv = encryptedPackage.slice(SALT_LENGTH, SALT_LENGTH + IV_LENGTH); const ciphertext = encryptedPackage.slice(SALT_LENGTH + IV_LENGTH);
-        const key = await deriveKey(userPassword, salt);
+        const key = await deriveKey(password, salt);
         try {
             const decryptedBuffer = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
             return decryptedBuffer;
@@ -623,7 +657,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const objectURL = URL.createObjectURL(blob);
             if (type === 'image') {
                 const img = new Image();
-                img.onload = () => resolve(objectURL);
+                img.onload = () => { URL.revokeObjectURL(objectURL); resolve(img.src); };
                 img.onerror = reject;
                 img.src = objectURL;
             } else if (type === 'video') {
@@ -785,9 +819,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 const blob = new Blob([decryptedBuffer]);
                 displayInLightbox(blob, type);
             } catch(err) { showToast(`Error loading file: ${err.message}`, 'error'); hideLightbox(); }
-        } else if (target.matches('.folder-item, #breadcrumb-container a')) {
-            const { path, name } = target.dataset;
-            navigateTo(path ?? name);
+        } else if (target.matches('.folder-item')) {
+            const folderName = target.dataset.name;
+            const newPath = `${currentPath}/${folderName}`.replace(/\/+/g, '/');
+            navigateTo(newPath);
+        } else if (target.matches('#breadcrumb-container a')) {
+            const path = target.dataset.path;
+            navigateTo(path);
         }
     });
 
@@ -844,6 +882,11 @@ document.addEventListener('DOMContentLoaded', () => {
         fetch(`?action=set_theme&theme=${isDark ? 'dark' : 'light'}`);
     });
 
+    logoutBtn.addEventListener('click', () => {
+        sessionStorage.removeItem('vaultPassword');
+        window.location.href = '?action=logout';
+    });
+
     // Lightbox close events
     lightboxCloseBtn.addEventListener('click', () => hideLightbox());
     lightboxBackdrop.addEventListener('click', () => hideLightbox());
@@ -851,6 +894,92 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Initial Render ---
     updateThemeIcons(document.documentElement.classList.contains('dark'));
     navigateTo(currentPath);
+});
+
+<?php else: ?>
+// --- AUTHENTICATION SCRIPT ---
+const showAuthToast = (text, type = 'info') => {
+    const container = document.getElementById('toast-container');
+    if (!container) return;
+    const toast = document.createElement('div');
+    const typeClasses = { success: 'bg-green-500', error: 'bg-red-500', info: 'bg-blue-500' };
+    toast.className = `toast p-4 rounded-lg text-white shadow-lg ${typeClasses[type] || typeClasses.info}`;
+    toast.textContent = text;
+    container.appendChild(toast);
+    setTimeout(() => toast.classList.add('show'), 10);
+    setTimeout(() => {
+        toast.classList.remove('show');
+        toast.addEventListener('transitionend', () => toast.remove());
+    }, 4000);
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+    const loginView = document.getElementById('login-view');
+    const registerView = document.getElementById('register-view');
+    const showRegisterBtn = document.getElementById('show-register');
+    const showLoginBtn = document.getElementById('show-login');
+    const loginForm = document.getElementById('login-form');
+    const registerForm = document.getElementById('register-form');
+    const loginError = document.getElementById('login-error');
+    const registerError = document.getElementById('register-error');
+
+    showRegisterBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        loginView.classList.add('hidden');
+        registerView.classList.remove('hidden');
+    });
+
+    showLoginBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        registerView.classList.add('hidden');
+        loginView.classList.remove('hidden');
+    });
+
+    loginForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        loginError.classList.add('hidden');
+        const formData = new FormData(loginForm);
+        formData.append('action', 'login');
+
+        try {
+            const response = await fetch('?', { method: 'POST', body: formData });
+            if (!response.ok) {
+                 const result = await response.json().catch(() => ({ message: 'An unknown error occurred.' }));
+                 throw new Error(result.message || 'Login failed.');
+            }
+            const result = await response.json();
+            if (result.status === 'success') {
+                sessionStorage.setItem('vaultPassword', formData.get('password'));
+                window.location.reload();
+            } else {
+                 throw new Error(result.message || 'Login failed.');
+            }
+        } catch (error) {
+            loginError.textContent = error.message;
+            loginError.classList.remove('hidden');
+        }
+    });
+
+    registerForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        registerError.classList.add('hidden');
+        const formData = new FormData(registerForm);
+        formData.append('action', 'register');
+
+        try {
+            const response = await fetch('?', { method: 'POST', body: formData });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.message || 'Registration failed.');
+
+            showAuthToast('Registration successful! Please log in.', 'success');
+            showLoginBtn.click();
+            registerForm.reset();
+
+        } catch (error) {
+            registerError.textContent = error.message;
+            registerError.classList.remove('hidden');
+        }
+    });
 });
 <?php endif; ?>
 </script>
