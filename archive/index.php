@@ -24,7 +24,7 @@ if (!is_dir($upload_dir)) {
 $base_path = realpath($upload_dir);
 
 // --- HELPER FUNCTIONS ---
-function format_bytes($bytes, $precision = 2) { if ($bytes === false) return 'N/A'; $units = ['B', 'KB', 'MB', 'GB', 'TB']; $bytes = max($bytes, 0); $pow = floor(($bytes ? log($bytes) : 0) / log(1024)); $pow = min($pow, count($units) - 1); $bytes /= (1 << (10 * $pow)); return round($bytes, $precision) . ' ' . $units[$pow]; }
+function format_bytes($bytes, $precision = 2) { if ($bytes === false) return 'N/A'; $units = ['B', 'KB', 'MB', 'GB', 'TB']; $bytes = max($bytes, 0); $pow = floor(($bytes ? log($bytes) : 0) / log(1024)); $pow = min($pow, count($units) - 1); $bytes /= (1 << (10 * $pow)); return round($bytes, $precision) . ' index.php' . $units[$pow]; }
 function get_media_type($filename) { $image_exts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp']; $video_exts = ['mp4', 'webm', 'ogg', 'mov', 'avi', 'wmv', 'mkv']; $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION)); if (in_array($extension, $image_exts)) return 'image'; if (in_array($extension, $video_exts)) return 'video'; return 'file'; }
 function sanitize_path($path, $base_path) { $path = urldecode($path); $path = preg_replace('~/{2,}~', '/', $path); $path = trim($path, '/'); $path_parts = explode('/', $path); $safe_parts = []; foreach ($path_parts as $part) { if ($part !== '.' && $part !== '..') { $safe_parts[] = $part; } } $safe_path_suffix = implode('/', $safe_parts); $full_path = $base_path . '/' . $safe_path_suffix; $real_base = realpath($base_path); $real_full_path = realpath($full_path); if ($real_full_path === false) { $real_full_path = $full_path; } if (strpos($real_full_path, $real_base) !== 0) { return false; } return '/' . $safe_path_suffix; }
 
