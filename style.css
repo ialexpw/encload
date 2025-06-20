@@ -1,0 +1,16 @@
+body { font-family: 'Inter', sans-serif; }
+.progress-bar, .item-container.deleting { transition: all 0.3s ease; }
+.modal-backdrop, .context-menu-backdrop { background-color: rgba(0,0,0,0.5); }
+.lightbox-backdrop { background-color: rgba(0,0,0,0.8); }
+.dragover { border-color: #3b82f6; }
+.view-btn.active { background-color: #e0e7ff; }
+.dark .view-btn.active { background-color: #312e81; }
+.item-container:hover .action-btn { opacity: 1; }
+.action-btn { opacity: 0; transition: opacity 0.2s; }
+.spinner { border: 2px solid #f3f3f3; border-top: 2px solid #3b82f6; border-radius: 50%; width: 14px; height: 14px; animation: spin 1s linear infinite; }
+@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+.toast { position: fixed; bottom: 1.5rem; right: 1.5rem; transform: translateY(200%); opacity: 0; transition: all 0.3s ease-in-out; z-index: 100; }
+.toast.show { transform: translateY(0); opacity: 1; }
+.item-container.deleting { opacity: 0; transform: scale(0.9); }
+.item-container.selected { box-shadow: 0 0 0 2px #3b82f6 !important; background-color: #eff6ff;}
+.dark .item-container.selected { background-color: #312e81; }
